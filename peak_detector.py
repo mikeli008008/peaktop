@@ -447,11 +447,20 @@ def compute_all_scores(data: dict, config: dict,
 
     triggers = check_overrides(data["vix"], data["spx"], data["hy"], config, as_of)
 
+    # as_of 默认用数据实际末尾日期 (规避 Streamlit Cloud 时区/时钟问题)
+    if as_of is None:
+        if not data["spx"].empty:
+            as_of_display = data["spx"].index[-1]
+        else:
+            as_of_display = pd.Timestamp.now()
+    else:
+        as_of_display = as_of
+
     return {
         "indicators": results,
         "total_score": total,
         "triggers": triggers,
-        "as_of": as_of or pd.Timestamp.now()
+        "as_of": as_of_display
     }
 
 
@@ -459,20 +468,25 @@ def compute_all_scores(data: dict, config: dict,
 # 数据批量加载
 # ============================================================
 
-@st.cache_data(ttl=14400, show_spinner="正在拉取市场数据...")
-def load_all_data(fred_api_key: str, period: str = "5y") -> dict:
-    """一次性加载所有需要的数据"""
+@st.cache_data(ttl=14400, show_spinner="正在拉取市场数据 (首次加载较慢, 约 30-60 秒)...")
+def load_all_data(fred_api_key: str, period: str = "max") -> dict:
+    """一次性加载所有需要的数据
+    
+    period='max' 拉取全部历史 (yfinance 通常给 20+ 年)
+    这样历史回看才能覆盖 2007/2018/2020/2022 等关键时点
+    """
     data = {
         "spx": fetch_yf("^GSPC", period),
         "ndx": fetch_yf("^NDX", period),
         "spy": fetch_yf("SPY", period),
         "rsp": fetch_yf("RSP", period),
         "vix": fetch_yf("^VIX", period),
-        "vix9d": fetch_yf("^VIX9D", period),
+        "vix9d": fetch_yf("^VIX9D", period),  # 2011年才有
         "skew": fetch_yf("^SKEW", period),
     }
 
-    start_date = (datetime.now() - timedelta(days=365*5)).strftime("%Y-%m-%d")
+    # FRED 拉 20 年历史
+    start_date = "2005-01-01"
     data["hy"] = fetch_fred("BAMLH0A0HYM2", fred_api_key, start_date)
     data["walcl"] = fetch_fred("WALCL", fred_api_key, start_date)
     data["wtregen"] = fetch_fred("WTREGEN", fred_api_key, start_date)
@@ -547,7 +561,7 @@ def main():
         数据来源: FRED (Federal Reserve Economic Data), Yahoo Finance
         """)
 
-    # 侧边栏
+    # 侧边栏 — 设置部分
     with st.sidebar:
         st.header("⚙️ 设置")
 
@@ -557,29 +571,6 @@ def main():
                                      help="在 https://fredaccount.stlouisfed.org/apikeys 免费申请")
         else:
             st.success("✅ FRED API Key 已加载")
-
-        st.divider()
-        st.subheader("📅 历史回看")
-        use_historical = st.checkbox("查看历史某日评分")
-        as_of_date = None
-        if use_historical:
-            as_of_date = st.date_input(
-                "选择日期",
-                value=datetime(2022, 1, 3).date(),
-                max_value=datetime.now().date()
-            )
-            as_of_date = pd.Timestamp(as_of_date)
-
-        st.divider()
-        st.subheader("📖 关于")
-        st.markdown("""
-        - 8 个指标覆盖 5 大维度
-        - 总分 ≥ 65 进入风险窗口
-        - 总分变化速度比绝对值更重要
-        - 详见 [methodology.md](https://github.com/YOUR_USERNAME/peak-detector/blob/main/methodology.md)
-        """)
-        st.divider()
-        st.caption("🌟 喜欢的话给个 [GitHub Star](https://github.com/YOUR_USERNAME/peak-detector)")
 
     if not fred_key:
         st.warning("⚠️ 请在侧边栏输入 FRED API Key")
@@ -598,8 +589,45 @@ def main():
         """)
         return
 
-    # 加载数据
+    # 加载数据 (拉取 20+ 年历史)
     data = load_all_data(fred_key)
+
+    # 用真实数据末尾日期作为日期选择器上限 (解决 Streamlit Cloud 时区问题)
+    if not data["spx"].empty:
+        data_max_date = data["spx"].index[-1].date()
+        data_min_date = data["spx"].index[0].date()
+    else:
+        data_max_date = datetime.now().date()
+        data_min_date = datetime(2005, 1, 1).date()
+
+    # 侧边栏 — 历史回看 (放在数据加载后)
+    with st.sidebar:
+        st.divider()
+        st.subheader("📅 历史回看")
+        st.caption(f"数据范围: {data_min_date} 至 {data_max_date}")
+        
+        use_historical = st.checkbox("查看历史某日评分")
+        as_of_date = None
+        if use_historical:
+            default_date = min(datetime(2022, 1, 3).date(), data_max_date)
+            as_of_date = st.date_input(
+                "选择日期",
+                value=default_date,
+                min_value=data_min_date,
+                max_value=data_max_date
+            )
+            as_of_date = pd.Timestamp(as_of_date)
+
+        st.divider()
+        st.subheader("📖 关于")
+        st.markdown("""
+        - 8 个指标覆盖 5 大维度
+        - 总分 ≥ 65 进入风险窗口
+        - 总分变化速度比绝对值更重要
+        - 详见 [methodology.md](https://github.com/YOUR_USERNAME/peak-detector/blob/main/methodology.md)
+        """)
+        st.divider()
+        st.caption("🌟 喜欢的话给个 [GitHub Star](https://github.com/YOUR_USERNAME/peak-detector)")
 
     # 计算评分
     result = compute_all_scores(data, config, as_of=as_of_date)
@@ -686,7 +714,7 @@ def main():
     st.divider()
 
     # ============== 下部:历史曲线 ==============
-    st.subheader("📈 历史风险评分曲线 (过去 2 年, 每周采样)")
+    st.subheader("📈 历史风险评分曲线 (过去 ~2 年, 每周采样)")
 
     with st.spinner("计算历史评分..."):
         hist = compute_historical_scores(data, config, days=500)
