@@ -1,0 +1,118 @@
+# Peak Detector 配置文件
+# 修改阈值和权重不需要改代码,改这里就行
+
+# 各指标权重 (总和必须 = 1.0)
+weights:
+  cta_positioning: 0.20
+  vix_skew: 0.15
+  gamma_env: 0.10
+  ad_divergence: 0.10
+  concentration: 0.10
+  putcall_proxy: 0.15
+  hy_spread: 0.10
+  fed_liquidity: 0.10
+
+# 风险等级映射 (总分 0-100)
+risk_levels:
+  - { max: 30,  level: "🟢 绿灯", color: "#22c55e", advice: "正常持仓,可加杠杆" }
+  - { max: 50,  level: "🟡 黄灯", color: "#eab308", advice: "标准仓位,停止加仓" }
+  - { max: 65,  level: "🟠 橙灯", color: "#f97316", advice: "减仓 20-30%,停止追高" }
+  - { max: 80,  level: "🔴 红灯", color: "#ef4444", advice: "减仓 50%+,买保护性 put" }
+  - { max: 100, level: "⚫ 深红", color: "#7f1d1d", advice: "防御仓位,转入现金/短债" }
+
+# 1. CTA Positioning - z-score 阈值
+cta_positioning:
+  thresholds:
+    - { max: 0.0, score: 0 }
+    - { max: 0.5, score: 2 }
+    - { max: 1.0, score: 4 }
+    - { max: 1.5, score: 6 }
+    - { max: 2.0, score: 8 }
+    - { max: 999, score: 10 }
+
+# 2. VIX/SKEW Complacency
+vix_skew:
+  vix_percentile_thresholds:
+    - { max: 0.05, score: 10 }
+    - { max: 0.15, score: 8 }
+    - { max: 0.30, score: 6 }
+    - { max: 0.50, score: 3 }
+    - { max: 1.00, score: 0 }
+  skew_thresholds:  # SKEW 越低越危险
+    - { max: 120, score: 10 }
+    - { max: 130, score: 8 }
+    - { max: 140, score: 6 }
+    - { max: 150, score: 3 }
+    - { max: 999, score: 0 }
+
+# 3. Gamma Environment Proxy
+gamma_env:
+  vrp_ratio_thresholds:  # realized/implied vol ratio
+    - { max: 0.3,  score: 10 }
+    - { max: 0.5,  score: 8 }
+    - { max: 0.7,  score: 5 }
+    - { max: 1.0,  score: 2 }
+    - { max: 999,  score: 0 }
+
+# 4. A/D Line Divergence (用 RSP/SPY 代理)
+ad_divergence:
+  duration_thresholds:  # 30 日内背离天数
+    - { max: 0,  score: 0 }
+    - { max: 3,  score: 3 }
+    - { max: 7,  score: 6 }
+    - { max: 15, score: 8 }
+    - { max: 999, score: 10 }
+
+# 5. Concentration Risk - RSP/SPY 60 日变化
+concentration:
+  thresholds:  # 60日变化百分比 (负值 = 集中度上升)
+    - { max: -0.05, score: 10 }
+    - { max: -0.02, score: 8 }
+    - { max: 0.00,  score: 5 }
+    - { max: 0.02,  score: 2 }
+    - { max: 999,   score: 0 }
+
+# 6. Put/Call Complacency (用 VIX9D/VIX contango 代理)
+putcall_proxy:
+  contango_percentile_thresholds:
+    - { max: 0.30, score: 0 }
+    - { max: 0.50, score: 2 }
+    - { max: 0.70, score: 5 }
+    - { max: 0.90, score: 8 }
+    - { max: 1.00, score: 10 }
+
+# 7. HY Credit Spread
+hy_spread:
+  # 20日变化 bps (取两个分数的较大值)
+  change_thresholds:
+    - { max: 0,    score: 0 }
+    - { max: 20,   score: 3 }
+    - { max: 50,   score: 6 }
+    - { max: 100,  score: 8 }
+    - { max: 9999, score: 10 }
+  percentile_thresholds:
+    - { max: 0.30, score: 0 }
+    - { max: 0.50, score: 2 }
+    - { max: 0.70, score: 4 }
+    - { max: 0.90, score: 6 }
+    - { max: 1.00, score: 8 }
+
+# 8. Fed Net Liquidity (13周变化%)
+fed_liquidity:
+  thresholds:
+    - { max: -0.03, score: 10 }
+    - { max: -0.01, score: 8 }
+    - { max: 0.01,  score: 5 }
+    - { max: 0.03,  score: 2 }
+    - { max: 999,   score: 0 }
+
+# Override 规则
+overrides:
+  vix_spike:
+    daily_change_pct: 0.30
+    close_above: 25
+  hy_blowout:
+    change_20d_bps: 100
+  spx_ma200_break:
+    enabled: true
+    lookback_days: 60
