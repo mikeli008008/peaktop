@@ -53,14 +53,23 @@ def get_fred_key() -> str:
 
 @st.cache_data(ttl=14400, show_spinner=False)  # 4小时缓存
 def fetch_yf(ticker: str, period: str = "3y") -> pd.DataFrame:
-    """从 yfinance 拉取数据"""
+    """从 yfinance 拉取数据 (鲁棒版)"""
     try:
         df = yf.download(ticker, period=period, progress=False, auto_adjust=True)
+        if df is None or df.empty:
+            return pd.DataFrame()
+        # 处理 MultiIndex columns (新版yfinance会返回 (col, ticker) 形式)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
+        # 验证关键列存在
+        if "Close" not in df.columns:
+            return pd.DataFrame()
+        # 删除全部为NaN的行
+        df = df.dropna(subset=["Close"])
+        if len(df) == 0:
+            return pd.DataFrame()
         return df
     except Exception as e:
-        st.warning(f"yfinance 拉取 {ticker} 失败: {e}")
         return pd.DataFrame()
 
 
@@ -110,16 +119,18 @@ def calc_cta_positioning(spx: pd.DataFrame, ndx: pd.DataFrame, config: dict,
     - 价格距 200MA 的偏离 (绝对%) → 越远说明 CTA 越满仓
     - 加上 Donchian 通道位置作为强化信号
     - 不使用滚动 z-score (会被长牛市钝化)
+    - 容错: NDX 缺失时只用 SPX
     """
-    if spx.empty or ndx.empty:
-        return 0, 0.0, "数据缺失"
+    if spx.empty:
+        return 0, 0.0, "SPX 数据缺失"
 
     if as_of:
         spx = spx[spx.index <= as_of]
-        ndx = ndx[ndx.index <= as_of]
+        if not ndx.empty:
+            ndx = ndx[ndx.index <= as_of]
 
-    if len(spx) < 200 or len(ndx) < 200:
-        return 0, 0.0, "历史数据不足"
+    if len(spx) < 200:
+        return 0, 0.0, "SPX 历史数据不足"
 
     def intensity(df):
         close = df["Close"]
@@ -128,39 +139,40 @@ def calc_cta_positioning(spx: pd.DataFrame, ndx: pd.DataFrame, config: dict,
         high60 = close.rolling(60).max()
         low60 = close.rolling(60).min()
 
-        # 距 200MA 偏离 (核心信号)
         deviation_200 = (close - sma200) / sma200
-        # 距 50MA 偏离
         deviation_50 = (close - sma50) / sma50
-        # Donchian 60日位置 (0-1, 1=接近高点)
         donchian_range = (high60 - low60).replace(0, np.nan)
         donchian_pos = (close - low60) / donchian_range
 
         return deviation_200, deviation_50, donchian_pos
 
     spx_d200, spx_d50, spx_donch = intensity(spx)
-    ndx_d200, ndx_d50, ndx_donch = intensity(ndx)
-
-    # 取两指数平均
-    dev_200 = (float(spx_d200.iloc[-1]) + float(ndx_d200.iloc[-1])) / 2
-    dev_50 = (float(spx_d50.iloc[-1]) + float(ndx_d50.iloc[-1])) / 2
-    donch = (float(spx_donch.iloc[-1]) + float(ndx_donch.iloc[-1])) / 2
+    
+    # NDX 可用就平均, 不可用就只用 SPX
+    use_ndx = (not ndx.empty) and len(ndx) >= 200
+    if use_ndx:
+        ndx_d200, ndx_d50, ndx_donch = intensity(ndx)
+        dev_200 = (float(spx_d200.iloc[-1]) + float(ndx_d200.iloc[-1])) / 2
+        dev_50 = (float(spx_d50.iloc[-1]) + float(ndx_d50.iloc[-1])) / 2
+        donch = (float(spx_donch.iloc[-1]) + float(ndx_donch.iloc[-1])) / 2
+        source = "SPX+NDX"
+    else:
+        dev_200 = float(spx_d200.iloc[-1])
+        dev_50 = float(spx_d50.iloc[-1])
+        donch = float(spx_donch.iloc[-1])
+        source = "SPX only"
 
     if np.isnan(dev_200):
         return 0, 0.0, "计算异常"
 
-    # 综合分: 用绝对偏离打分
-    # 距 200MA > 15% 且接近 60日高点 = CTA 已极度满仓
     score = threshold_to_score(dev_200, config["cta_positioning"]["thresholds"])
 
-    # 强化: 如果 Donchian 位置 > 0.85 (接近 60日高点), 至少 6 分
     if donch > 0.85 and score < 6:
         score = 6
-    # 双重强化: 距 200MA > 12% 且 Donchian > 0.90, 至少 8 分
     if dev_200 > 0.12 and donch > 0.90 and score < 8:
         score = 8
 
-    detail = f"距200MA: {dev_200*100:+.1f}% | 距50MA: {dev_50*100:+.1f}% | Donchian: {donch:.2f}"
+    detail = f"距200MA: {dev_200*100:+.1f}% | 距50MA: {dev_50*100:+.1f}% | Donchian: {donch:.2f} ({source})"
     return score, dev_200, detail
 
 
@@ -528,18 +540,34 @@ def compute_all_scores(data: dict, config: dict,
 def load_all_data(fred_api_key: str, period: str = "max") -> dict:
     """一次性加载所有需要的数据
     
-    period='max' 拉取全部历史 (yfinance 通常给 20+ 年)
-    这样历史回看才能覆盖 2007/2018/2020/2022 等关键时点
+    period='max' 拉取全部历史
+    带 fallback 机制: Streamlit Cloud 上 ^GSPC, ^NDX 等 ticker 经常失败,
+    自动回退到 SPY, QQQ 等 ETF 数据
     """
+    def fetch_with_fallback(primary: str, fallback: str, period: str):
+        """先试 primary, 失败用 fallback"""
+        df = fetch_yf(primary, period)
+        if df.empty or len(df) < 100:
+            df = fetch_yf(fallback, period)
+        return df
+    
     data = {
-        "spx": fetch_yf("^GSPC", period),
-        "ndx": fetch_yf("^NDX", period),
+        # SPX: 优先 ^GSPC, 失败用 SPY
+        "spx": fetch_with_fallback("^GSPC", "SPY", period),
+        # NDX: 优先 ^NDX, 失败用 QQQ
+        "ndx": fetch_with_fallback("^NDX", "QQQ", period),
         "spy": fetch_yf("SPY", period),
         "rsp": fetch_yf("RSP", period),
         "vix": fetch_yf("^VIX", period),
         "vix9d": fetch_yf("^VIX9D", period),  # 2011年才有
         "skew": fetch_yf("^SKEW", period),
     }
+    
+    # 如果 SPY 主数据也失败了, 用 spx 兜底
+    if data["spy"].empty:
+        data["spy"] = data["spx"]
+    
+    # 如果 rsp 失败, ad_divergence 和 concentration 会失效, 但其他指标不影响
 
     # FRED 拉 20 年历史
     start_date = "2005-01-01"
