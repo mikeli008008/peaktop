@@ -1,7 +1,5 @@
-# Peak Detector 配置文件
-# 修改阈值和权重不需要改代码,改这里就行
+# Peak Detector 配置 (v3 - 历史校准版)
 
-# 各指标权重 (总和必须 = 1.0)
 weights:
   cta_positioning: 0.20
   vix_skew: 0.15
@@ -12,7 +10,6 @@ weights:
   hy_spread: 0.10
   fed_liquidity: 0.10
 
-# 风险等级映射 (总分 0-100)
 risk_levels:
   - { max: 30,  level: "🟢 绿灯", color: "#22c55e", advice: "正常持仓,可加杠杆" }
   - { max: 50,  level: "🟡 黄灯", color: "#eab308", advice: "标准仓位,停止加仓" }
@@ -20,43 +17,50 @@ risk_levels:
   - { max: 80,  level: "🔴 红灯", color: "#ef4444", advice: "减仓 50%+,买保护性 put" }
   - { max: 100, level: "⚫ 深红", color: "#7f1d1d", advice: "防御仓位,转入现金/短债" }
 
-# 1. CTA Positioning - z-score 阈值
+# 1. CTA Positioning - 调更敏感 (8-9%就给6分)
 cta_positioning:
   thresholds:
-    - { max: 0.0, score: 0 }
-    - { max: 0.5, score: 2 }
-    - { max: 1.0, score: 4 }
-    - { max: 1.5, score: 6 }
-    - { max: 2.0, score: 8 }
-    - { max: 999, score: 10 }
+    - { max: 0.03, score: 0 }
+    - { max: 0.05, score: 3 }
+    - { max: 0.07, score: 5 }
+    - { max: 0.09, score: 7 }
+    - { max: 0.12, score: 8 }
+    - { max: 999,  score: 10 }
 
-# 2. VIX/SKEW Complacency
+# 2. VIX/SKEW
 vix_skew:
-  vix_percentile_thresholds:
-    - { max: 0.05, score: 10 }
-    - { max: 0.15, score: 8 }
-    - { max: 0.30, score: 6 }
-    - { max: 0.50, score: 3 }
-    - { max: 1.00, score: 0 }
-  skew_thresholds:  # SKEW 越低越危险
+  vix_absolute_thresholds:
+    - { max: 12,  score: 10 }
+    - { max: 14,  score: 8 }
+    - { max: 16,  score: 7 }
+    - { max: 18,  score: 5 }
+    - { max: 22,  score: 2 }
+    - { max: 999, score: 0 }
+  skew_thresholds:
     - { max: 120, score: 10 }
-    - { max: 130, score: 8 }
-    - { max: 140, score: 6 }
-    - { max: 150, score: 3 }
+    - { max: 130, score: 7 }
+    - { max: 140, score: 4 }
+    - { max: 150, score: 2 }
     - { max: 999, score: 0 }
 
-# 3. Gamma Environment Proxy
+# 3. Gamma Environment
 gamma_env:
-  vrp_ratio_thresholds:  # realized/implied vol ratio
+  vrp_ratio_thresholds:
     - { max: 0.3,  score: 10 }
     - { max: 0.5,  score: 8 }
     - { max: 0.7,  score: 5 }
     - { max: 1.0,  score: 2 }
     - { max: 999,  score: 0 }
+  rv_absolute_thresholds:
+    - { max: 0.08, score: 10 }
+    - { max: 0.10, score: 8 }
+    - { max: 0.12, score: 6 }
+    - { max: 0.15, score: 3 }
+    - { max: 999,  score: 0 }
 
-# 4. A/D Line Divergence (用 RSP/SPY 代理)
+# 4. A/D Line Divergence
 ad_divergence:
-  duration_thresholds:  # 30 日内背离天数
+  duration_thresholds:
     - { max: 0,  score: 0 }
     - { max: 3,  score: 3 }
     - { max: 7,  score: 6 }
@@ -65,25 +69,26 @@ ad_divergence:
 
 # 5. Concentration Risk - RSP/SPY 60 日变化
 concentration:
-  thresholds:  # 60日变化百分比 (负值 = 集中度上升)
+  thresholds:
     - { max: -0.05, score: 10 }
     - { max: -0.02, score: 8 }
     - { max: 0.00,  score: 5 }
     - { max: 0.02,  score: 2 }
     - { max: 999,   score: 0 }
 
-# 6. Put/Call Complacency (用 VIX9D/VIX contango 代理)
+# 6. Put/Call - 用绝对 contango 水平
+# contango = 1 - VIX9D/VIX, 越大越 complacent
+# 历史: 持续 contango > 0.10 是 complacency
 putcall_proxy:
-  contango_percentile_thresholds:
-    - { max: 0.30, score: 0 }
-    - { max: 0.50, score: 2 }
-    - { max: 0.70, score: 5 }
-    - { max: 0.90, score: 8 }
-    - { max: 1.00, score: 10 }
+  contango_absolute_thresholds:
+    - { max: 0.00, score: 0 }    # 倒挂或平的, 紧张
+    - { max: 0.04, score: 2 }    # 轻微 contango
+    - { max: 0.08, score: 5 }    # 中度 contango
+    - { max: 0.12, score: 8 }    # 强 contango, complacency
+    - { max: 999,  score: 10 }   # 极强 contango
 
 # 7. HY Credit Spread
 hy_spread:
-  # 20日变化 bps (取两个分数的较大值)
   change_thresholds:
     - { max: 0,    score: 0 }
     - { max: 20,   score: 3 }
@@ -96,8 +101,14 @@ hy_spread:
     - { max: 0.70, score: 4 }
     - { max: 0.90, score: 6 }
     - { max: 1.00, score: 8 }
+  absolute_thresholds:
+    - { max: 3.0,  score: 10 }
+    - { max: 3.5,  score: 8 }
+    - { max: 4.0,  score: 6 }
+    - { max: 5.0,  score: 3 }
+    - { max: 999,  score: 0 }
 
-# 8. Fed Net Liquidity (13周变化%)
+# 8. Fed Net Liquidity
 fed_liquidity:
   thresholds:
     - { max: -0.03, score: 10 }
@@ -106,7 +117,6 @@ fed_liquidity:
     - { max: 0.03,  score: 2 }
     - { max: 999,   score: 0 }
 
-# Override 规则
 overrides:
   vix_spike:
     daily_change_pct: 0.30
@@ -115,4 +125,6 @@ overrides:
     change_20d_bps: 100
   spx_ma200_break:
     enabled: true
+    lookback_days: 60
+
     lookback_days: 60
