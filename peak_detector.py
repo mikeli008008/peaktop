@@ -104,7 +104,13 @@ def get_risk_level(total_score: float, risk_levels: list) -> dict:
 
 def calc_cta_positioning(spx: pd.DataFrame, ndx: pd.DataFrame, config: dict,
                          as_of: Optional[pd.Timestamp] = None) -> Tuple[int, float, str]:
-    """指标1: CTA Positioning Proxy"""
+    """指标1: CTA Positioning Proxy
+    
+    改进版: 用绝对水平判断 CTA 多头拥挤度
+    - 价格距 200MA 的偏离 (绝对%) → 越远说明 CTA 越满仓
+    - 加上 Donchian 通道位置作为强化信号
+    - 不使用滚动 z-score (会被长牛市钝化)
+    """
     if spx.empty or ndx.empty:
         return 0, 0.0, "数据缺失"
 
@@ -112,43 +118,60 @@ def calc_cta_positioning(spx: pd.DataFrame, ndx: pd.DataFrame, config: dict,
         spx = spx[spx.index <= as_of]
         ndx = ndx[ndx.index <= as_of]
 
-    if len(spx) < 252 or len(ndx) < 252:
+    if len(spx) < 200 or len(ndx) < 200:
         return 0, 0.0, "历史数据不足"
 
     def intensity(df):
         close = df["Close"]
         sma200 = close.rolling(200).mean()
         sma50 = close.rolling(50).mean()
-        high20 = close.rolling(20).max()
-        low20 = close.rolling(20).min()
+        high60 = close.rolling(60).max()
+        low60 = close.rolling(60).min()
 
-        s1 = (close - sma200) / sma200
-        s2 = (close - sma50) / sma50
-        donchian_range = (high20 - low20).replace(0, np.nan)
-        s3 = (close - low20) / donchian_range - 0.5
+        # 距 200MA 偏离 (核心信号)
+        deviation_200 = (close - sma200) / sma200
+        # 距 50MA 偏离
+        deviation_50 = (close - sma50) / sma50
+        # Donchian 60日位置 (0-1, 1=接近高点)
+        donchian_range = (high60 - low60).replace(0, np.nan)
+        donchian_pos = (close - low60) / donchian_range
 
-        return (s1 + s2 + s3) / 3
+        return deviation_200, deviation_50, donchian_pos
 
-    spx_int = intensity(spx)
-    ndx_int = intensity(ndx)
-    combined = (spx_int + ndx_int) / 2
+    spx_d200, spx_d50, spx_donch = intensity(spx)
+    ndx_d200, ndx_d50, ndx_donch = intensity(ndx)
 
-    rolling_mean = combined.rolling(252).mean()
-    rolling_std = combined.rolling(252).std()
-    z = (combined - rolling_mean) / rolling_std
+    # 取两指数平均
+    dev_200 = (float(spx_d200.iloc[-1]) + float(ndx_d200.iloc[-1])) / 2
+    dev_50 = (float(spx_d50.iloc[-1]) + float(ndx_d50.iloc[-1])) / 2
+    donch = (float(spx_donch.iloc[-1]) + float(ndx_donch.iloc[-1])) / 2
 
-    current_z = float(z.iloc[-1])
-    if np.isnan(current_z):
+    if np.isnan(dev_200):
         return 0, 0.0, "计算异常"
 
-    score = threshold_to_score(current_z, config["cta_positioning"]["thresholds"])
-    detail = f"Z-score: {current_z:+.2f}"
-    return score, current_z, detail
+    # 综合分: 用绝对偏离打分
+    # 距 200MA > 15% 且接近 60日高点 = CTA 已极度满仓
+    score = threshold_to_score(dev_200, config["cta_positioning"]["thresholds"])
+
+    # 强化: 如果 Donchian 位置 > 0.85 (接近 60日高点), 至少 6 分
+    if donch > 0.85 and score < 6:
+        score = 6
+    # 双重强化: 距 200MA > 12% 且 Donchian > 0.90, 至少 8 分
+    if dev_200 > 0.12 and donch > 0.90 and score < 8:
+        score = 8
+
+    detail = f"距200MA: {dev_200*100:+.1f}% | 距50MA: {dev_50*100:+.1f}% | Donchian: {donch:.2f}"
+    return score, dev_200, detail
 
 
 def calc_vix_skew(vix: pd.DataFrame, skew: pd.DataFrame, config: dict,
                   as_of: Optional[pd.Timestamp] = None) -> Tuple[int, dict, str]:
-    """指标2: VIX/SKEW Complacency"""
+    """指标2: VIX/SKEW Complacency
+    
+    改进版: 用绝对水平判断 complacency
+    - 滚动百分位在持续低 VIX 制度下会失效 (2021那种)
+    - 改用 VIX 绝对水平直接打分
+    """
     if vix.empty:
         return 0, {}, "数据缺失"
 
@@ -157,34 +180,42 @@ def calc_vix_skew(vix: pd.DataFrame, skew: pd.DataFrame, config: dict,
         if not skew.empty:
             skew = skew[skew.index <= as_of]
 
-    if len(vix) < 252:
+    if len(vix) < 30:
         return 0, {}, "历史数据不足"
 
     current_vix = float(vix["Close"].iloc[-1])
-    vix_252 = vix["Close"].iloc[-252:]
-    vix_percentile = (vix_252 < current_vix).sum() / 252
-
-    vix_score = threshold_to_score(vix_percentile, config["vix_skew"]["vix_percentile_thresholds"])
+    
+    # VIX 30日均值平滑 (避免单日噪音)
+    vix_ma30 = float(vix["Close"].rolling(30).mean().iloc[-1])
+    effective_vix = min(current_vix, vix_ma30)  # 取较低值,更准确反映 complacency
+    
+    # VIX 绝对水平打分 (取代百分位)
+    vix_score = threshold_to_score(effective_vix, config["vix_skew"]["vix_absolute_thresholds"])
 
     if not skew.empty and len(skew) > 0:
         current_skew = float(skew["Close"].iloc[-1])
-        skew_score = threshold_to_score(current_skew, config["vix_skew"]["skew_thresholds"])
+        skew_ma30 = float(skew["Close"].rolling(30).mean().iloc[-1])
+        effective_skew = max(current_skew, skew_ma30)  # SKEW 较高值更准
+        skew_score = threshold_to_score(effective_skew, config["vix_skew"]["skew_thresholds"])
     else:
         current_skew = None
         skew_score = vix_score
 
-    final_score = int(0.5 * vix_score + 0.5 * skew_score)
+    final_score = int(0.6 * vix_score + 0.4 * skew_score)
 
-    detail = f"VIX: {current_vix:.1f} (P{vix_percentile*100:.0f})"
+    detail = f"VIX: {current_vix:.1f} (30dMA {vix_ma30:.1f})"
     if current_skew:
-        detail += f" | SKEW: {current_skew:.1f}"
+        detail += f" | SKEW: {current_skew:.0f}"
 
-    return final_score, {"vix": current_vix, "vix_pct": vix_percentile, "skew": current_skew}, detail
+    return final_score, {"vix": current_vix, "skew": current_skew}, detail
 
 
 def calc_gamma_env(spx: pd.DataFrame, vix: pd.DataFrame, config: dict,
                    as_of: Optional[pd.Timestamp] = None) -> Tuple[int, float, str]:
-    """指标3: Gamma Environment (realized vs implied vol)"""
+    """指标3: Gamma Environment (realized vs implied vol)
+    
+    改进版: 用绝对 RV 水平兜底,因为 RV/IV 比率在低 vol 制度下噪音大
+    """
     if spx.empty or vix.empty:
         return 0, 0.0, "数据缺失"
 
@@ -199,15 +230,23 @@ def calc_gamma_env(spx: pd.DataFrame, vix: pd.DataFrame, config: dict,
     rv_30d = returns.rolling(30).std() * np.sqrt(252)
 
     current_rv = float(rv_30d.iloc[-1])
-    current_vix = float(vix["Close"].iloc[-1]) / 100
+    current_vix_pct = float(vix["Close"].iloc[-1]) / 100
 
-    if current_vix <= 0:
+    if current_vix_pct <= 0:
         return 0, 0.0, "VIX 异常"
 
-    vrp_ratio = current_rv / current_vix
-    score = threshold_to_score(vrp_ratio, config["gamma_env"]["vrp_ratio_thresholds"])
+    vrp_ratio = current_rv / current_vix_pct
+    
+    # 主信号: RV/IV 比率
+    score_ratio = threshold_to_score(vrp_ratio, config["gamma_env"]["vrp_ratio_thresholds"])
+    
+    # 兜底: 绝对 RV 水平 (低 RV = dealer long gamma, complacency)
+    score_abs = threshold_to_score(current_rv, config["gamma_env"]["rv_absolute_thresholds"])
+    
+    # 取较大值
+    score = max(score_ratio, score_abs)
 
-    detail = f"RV/IV: {vrp_ratio:.2f} (RV={current_rv*100:.1f}%, IV={current_vix*100:.1f}%)"
+    detail = f"RV(30d): {current_rv*100:.1f}% | IV: {current_vix_pct*100:.1f}% | RV/IV: {vrp_ratio:.2f}"
     return score, vrp_ratio, detail
 
 
@@ -277,7 +316,13 @@ def calc_concentration(spy: pd.DataFrame, rsp: pd.DataFrame, config: dict,
 
 def calc_putcall_proxy(vix9d: pd.DataFrame, vix: pd.DataFrame, config: dict,
                        as_of: Optional[pd.Timestamp] = None) -> Tuple[int, float, str]:
-    """指标6: Put/Call Complacency (VIX9D/VIX contango proxy)"""
+    """指标6: Put/Call Complacency (VIX9D/VIX contango proxy)
+    
+    改进版: 用绝对 contango 水平
+    - contango 很大 (短期VIX远低于长期VIX) = complacency
+    - contango 收窄或倒挂 = 短期紧张, 已经在 stress 边缘
+    - 历史校准: contango > 0.10 是典型 complacency
+    """
     if vix9d.empty or vix.empty:
         return 0, 0.0, "数据缺失"
 
@@ -290,19 +335,22 @@ def calc_putcall_proxy(vix9d: pd.DataFrame, vix: pd.DataFrame, config: dict,
         "vix": vix["Close"]
     }).dropna()
 
-    if len(merged) < 252:
+    if len(merged) < 30:
         return 0, 0.0, "历史数据不足"
 
     merged["ts_ratio"] = merged["vix9d"] / merged["vix"]
     merged["contango"] = 1 - merged["ts_ratio"]
 
     current_contango = float(merged["contango"].iloc[-1])
-    history = merged["contango"].iloc[-252:]
-    percentile = (history < current_contango).sum() / len(history)
+    # 30日均值平滑
+    contango_ma30 = float(merged["contango"].rolling(30).mean().iloc[-1])
+    effective_contango = max(current_contango, contango_ma30)  # 较大值更准
+    
+    # 绝对 contango 水平直接打分
+    score = threshold_to_score(effective_contango, config["putcall_proxy"]["contango_absolute_thresholds"])
 
-    score = threshold_to_score(percentile, config["putcall_proxy"]["contango_percentile_thresholds"])
-    detail = f"VIX9D/VIX contango P{percentile*100:.0f}"
-    return score, percentile, detail
+    detail = f"VIX9D/VIX contango: {current_contango:.3f} (30dMA {contango_ma30:.3f})"
+    return score, effective_contango, detail
 
 
 def calc_hy_spread(hy: pd.Series, config: dict,
@@ -326,9 +374,17 @@ def calc_hy_spread(hy: pd.Series, config: dict,
 
     change_score = threshold_to_score(change_bps, config["hy_spread"]["change_thresholds"])
     pct_score = threshold_to_score(percentile, config["hy_spread"]["percentile_thresholds"])
-    final_score = max(change_score, pct_score)
+    
+    # 绝对水平兜底: HY < 3.5% 是历史性 complacency, 信贷市场对风险定价过低
+    # 反过来 HY > 6% 是已经在 stress
+    abs_score = threshold_to_score(current, config["hy_spread"]["absolute_thresholds"])
+    
+    # 综合: 利差扩大或处于历史高位 = 风险已显现 (取较大)
+    #       利差极低 = complacency,反向风险 (单独打分)
+    risk_score = max(change_score, pct_score)
+    final_score = max(risk_score, abs_score)
 
-    detail = f"HY OAS: {current:.2f}% | 20日变化: {change_bps:+.0f}bps | P{percentile*100:.0f}"
+    detail = f"HY OAS: {current:.2f}% | 20日: {change_bps:+.0f}bps | P{percentile*100:.0f}"
     return final_score, {"current": current, "change_bps": change_bps, "percentile": percentile}, detail
 
 
