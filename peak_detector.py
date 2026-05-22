@@ -689,6 +689,38 @@ def main():
     result = compute_all_scores(data, config, as_of=as_of_date)
     total = result["total_score"]
     risk_level = get_risk_level(total, config["risk_levels"])
+    
+    # 数据加载诊断 (折叠在 expander 里, 默认不显示)
+    with st.expander("🔧 数据加载诊断 (排错用)"):
+        diag_cols = st.columns(4)
+        data_status = [
+            ("SPX ^GSPC", data["spx"]),
+            ("NDX ^NDX", data["ndx"]),
+            ("SPY", data["spy"]),
+            ("RSP", data["rsp"]),
+            ("VIX ^VIX", data["vix"]),
+            ("VIX9D ^VIX9D", data["vix9d"]),
+            ("SKEW ^SKEW", data["skew"]),
+            ("HY (FRED)", data["hy"]),
+            ("WALCL (FRED)", data["walcl"]),
+            ("WTREGEN (FRED)", data["wtregen"]),
+            ("RRP (FRED)", data["rrp"]),
+        ]
+        for i, (name, df) in enumerate(data_status):
+            with diag_cols[i % 4]:
+                if hasattr(df, 'empty') and df.empty:
+                    st.error(f"❌ {name}: 空")
+                else:
+                    n = len(df)
+                    if hasattr(df, 'index') and len(df) > 0:
+                        last_date = df.index[-1]
+                        st.success(f"✅ {name}: {n} 条, 末日 {last_date.strftime('%Y-%m-%d') if hasattr(last_date, 'strftime') else last_date}")
+                    else:
+                        st.warning(f"⚠️ {name}: {n} 条")
+        
+        st.markdown("**各指标原始详情:**")
+        for key, ind in result["indicators"].items():
+            st.text(f"{ind['name']:25s} | 分数 {ind['score']}/10 | {ind['detail']}")
 
     # ============== 顶部:总分大显示 ==============
     col1, col2, col3 = st.columns([2, 1, 1])
