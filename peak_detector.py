@@ -365,6 +365,76 @@ def calc_putcall_proxy(vix9d: pd.DataFrame, vix: pd.DataFrame, config: dict,
     return score, effective_contango, detail
 
 
+def calc_overextension(spx: pd.DataFrame, ndx: pd.DataFrame, config: dict,
+                       as_of: Optional[pd.Timestamp] = None) -> Tuple[int, float, str]:
+    """指标: Price Overextension (距 50MA 超买度)
+    
+    v5 新增: 回测中预测力最强的单一信号之一 (ret20 corr -0.11)
+    单边打分: 只对上方偏离计分 (mean reversion 信号)
+    """
+    if spx.empty:
+        return 0, 0.0, "SPX 数据缺失"
+
+    s = spx[spx.index <= as_of]["Close"] if as_of is not None else spx["Close"]
+    if len(s) < 50:
+        return 0, 0.0, "历史数据不足"
+
+    s_ma = s.rolling(50).mean()
+    s_dev = (float(s.iloc[-1]) - float(s_ma.iloc[-1])) / float(s_ma.iloc[-1])
+
+    use_ndx = (not ndx.empty)
+    if use_ndx:
+        n = ndx[ndx.index <= as_of]["Close"] if as_of is not None else ndx["Close"]
+        if len(n) >= 50:
+            n_ma = n.rolling(50).mean()
+            n_dev = (float(n.iloc[-1]) - float(n_ma.iloc[-1])) / float(n_ma.iloc[-1])
+            dev = (s_dev + n_dev) / 2
+        else:
+            dev = s_dev
+    else:
+        dev = s_dev
+
+    score = threshold_to_score(dev, config["overextension"]["thresholds"])
+    detail = f"距50MA: {dev*100:+.1f}% (SPX+NDX平均)"
+    return score, dev, detail
+
+
+def calc_smt_divergence(spx: pd.DataFrame, ndx: pd.DataFrame, config: dict,
+                        as_of: Optional[pd.Timestamp] = None) -> Tuple[int, int, str]:
+    """指标: SMT 背离 (NQ vs ES, 日线)
+    
+    ICT 概念: 最近10日内一个指数创60日新高而另一个没有 = 背离
+    ⚠️ 回测显示日线 SMT 对未来回报无预测力 (corr +0.01),
+    因此【仅展示, 不计入总分】(权重=0)。日内 SMT 在 killzone 内仍有效,
+    但日线频率上信号消失。
+    """
+    if spx.empty or ndx.empty:
+        return 0, 0, "数据缺失"
+
+    s = spx[spx.index <= as_of]["Close"] if as_of is not None else spx["Close"]
+    n = ndx[ndx.index <= as_of]["Close"] if as_of is not None else ndx["Close"]
+    if len(s) < 80 or len(n) < 80:
+        return 0, 0, "历史数据不足"
+
+    high_lookback, recent_window = 60, 10
+    s_roll_max = s.rolling(high_lookback).max()
+    n_roll_max = n.rolling(high_lookback).max()
+    s_made = bool((s >= s_roll_max * 0.9995).iloc[-recent_window:].any())
+    n_made = bool((n >= n_roll_max * 0.9995).iloc[-recent_window:].any())
+
+    if s_made and n_made:
+        return 0, 0, "ES/NQ 双双新高, 无背离"
+    if not s_made and not n_made:
+        return 0, 0, "双双无新高, 非顶部区域"
+
+    s_nh = (s >= s_roll_max * 0.9995).iloc[-20:]
+    n_nh = (n >= n_roll_max * 0.9995).iloc[-20:]
+    div_days = int((s_nh != n_nh).sum())
+    leader = "NQ创新高/ES未确认 ⚠️" if n_made else "ES创新高/NQ未确认 ⚠️"
+    score = 9 if div_days >= 10 else 7 if div_days >= 5 else 5
+    return score, div_days, f"{leader} 背离持续{div_days}日"
+
+
 def calc_hy_spread(hy: pd.Series, config: dict,
                    as_of: Optional[pd.Timestamp] = None) -> Tuple[int, dict, str]:
     """指标7: HY Credit Spread"""
@@ -440,7 +510,8 @@ def calc_fed_liquidity(walcl: pd.Series, wtregen: pd.Series, rrp: pd.Series, con
 # ============================================================
 
 def check_overrides(vix: pd.DataFrame, spx: pd.DataFrame, hy: pd.Series,
-                    config: dict, as_of: Optional[pd.Timestamp] = None) -> list:
+                    config: dict, as_of: Optional[pd.Timestamp] = None,
+                    jpy: Optional[pd.DataFrame] = None) -> list:
     """检查是否触发强制升档规则"""
     triggers = []
 
@@ -474,7 +545,60 @@ def check_overrides(vix: pd.DataFrame, spx: pd.DataFrame, hy: pd.Series,
         if current_below and recent_above:
             triggers.append(f"⚠️ 标普首次跌破 200 日均线")
 
+    # v5.1: 日元 carry unwind 警报
+    # 回测: USDJPY 20日跌>3% 时, 未来20日跌>5%概率从14.7%升至22.1%
+    if "yen_carry" in overrides and jpy is not None and not jpy.empty:
+        j = jpy[jpy.index <= as_of]["Close"] if as_of is not None else jpy["Close"]
+        if len(j) >= 21:
+            jpy_20d = (float(j.iloc[-1]) - float(j.iloc[-21])) / float(j.iloc[-21]) * 100
+            if jpy_20d < overrides["yen_carry"]["jpy_20d_change_pct"]:
+                triggers.append(f"⚠️ 日元急升: USDJPY 20日 {jpy_20d:+.1f}% (carry unwind 风险, 参考2024年8月)")
+
     return triggers
+
+
+def third_friday(year: int, month: int) -> pd.Timestamp:
+    """月度 OPEX 日 (第三个周五)"""
+    start = pd.Timestamp(year=year, month=month, day=1)
+    fridays = pd.date_range(start, start + pd.offsets.MonthEnd(0), freq='W-FRI')
+    return fridays[2]
+
+
+def get_upcoming_events(config: dict, as_of: pd.Timestamp, horizon_days: int = 14) -> list:
+    """收集未来 N 天的事件: FOMC/BoJ/CPI/OPEX/手动事件
+    返回 [{date, name, type, days_until}] 按日期排序"""
+    events = []
+    ev_cfg = config.get("events", {})
+    as_of_date = pd.Timestamp(as_of).normalize()
+    end = as_of_date + pd.Timedelta(days=horizon_days)
+
+    type_map = [("fomc", "FOMC 利率决议", "policy"),
+                ("boj", "日银决议 (carry风险)", "policy"),
+                ("cpi", "美国 CPI 公布", "macro")]
+    for key, label, etype in type_map:
+        for d_str in ev_cfg.get(key, []):
+            d = pd.Timestamp(d_str)
+            if as_of_date <= d <= end:
+                events.append({"date": d, "name": label, "type": etype,
+                               "days_until": (d - as_of_date).days})
+
+    # OPEX (任意年份可计算)
+    for m_offset in range(0, 2):
+        target = as_of_date + pd.offsets.MonthBegin(m_offset) if m_offset > 0 else as_of_date.replace(day=1)
+        opex = third_friday(target.year, target.month)
+        if as_of_date <= opex <= end:
+            quad = "(季度三巫日)" if target.month in (3, 6, 9, 12) else ""
+            events.append({"date": opex, "name": f"月度 OPEX {quad}", "type": "opex",
+                           "days_until": (opex - as_of_date).days})
+
+    # 手动事件 (IPO 等)
+    for ev in ev_cfg.get("manual_events", []):
+        d = pd.Timestamp(ev["date"])
+        if as_of_date <= d <= end:
+            events.append({"date": d, "name": ev["name"], "type": ev.get("type", "other"),
+                           "days_until": (d - as_of_date).days})
+
+    return sorted(events, key=lambda x: x["date"])
 
 
 # ============================================================
@@ -504,6 +628,9 @@ def compute_all_scores(data: dict, config: dict,
     score, raw, detail = calc_putcall_proxy(data["vix9d"], data["vix"], config, as_of)
     results["putcall_proxy"] = {"score": score, "raw": raw, "detail": detail, "name": "Put/Call Proxy"}
 
+    score, raw, detail = calc_overextension(data["spx"], data["ndx"], config, as_of)
+    results["overextension"] = {"score": score, "raw": raw, "detail": detail, "name": "Price Overextension"}
+
     score, raw, detail = calc_hy_spread(data["hy"], config, as_of)
     results["hy_spread"] = {"score": score, "raw": raw, "detail": detail, "name": "HY Credit Spread"}
 
@@ -513,7 +640,25 @@ def compute_all_scores(data: dict, config: dict,
     weights = config["weights"]
     total = sum(results[k]["score"] * weights[k] for k in weights) * 10
 
-    triggers = check_overrides(data["vix"], data["spx"], data["hy"], config, as_of)
+    # SMT 背离: 仅展示, 不计入总分 (回测显示日线频率无预测力)
+    smt_score, smt_raw, smt_detail = calc_smt_divergence(data["spx"], data["ndx"], config, as_of)
+    smt_info = {"score": smt_score, "raw": smt_raw, "detail": smt_detail, "name": "SMT Divergence (NQ/ES)"}
+
+    # 回撤概率查询 (基于2010-2026回测的经验分布)
+    prob_info = None
+    if "prob_table_20d" in config:
+        for row in config["prob_table_20d"]:
+            if row["lo"] <= total < row["hi"]:
+                prob_info = {"d20": row}
+                break
+        if prob_info and "prob_table_10d" in config:
+            for row in config["prob_table_10d"]:
+                if row["lo"] <= total < row["hi"]:
+                    prob_info["d10"] = row
+                    break
+
+    triggers = check_overrides(data["vix"], data["spx"], data["hy"], config, as_of,
+                               jpy=data.get("jpy"))
 
     # as_of 默认用数据实际末尾日期 (规避 Streamlit Cloud 时区/时钟问题)
     if as_of is None:
@@ -524,11 +669,23 @@ def compute_all_scores(data: dict, config: dict,
     else:
         as_of_display = as_of
 
+    # v5.1: 事件风险窗口 (未来14日)
+    upcoming_events = get_upcoming_events(config, as_of_display, horizon_days=14)
+    # 高分 + 重大事件5日内 → 升档建议 (事件本身不改分数)
+    major_soon = [e for e in upcoming_events
+                  if e["type"] in ("policy", "macro", "liquidity") and e["days_until"] <= 5]
+    if total >= 55 and major_soon:
+        names = ", ".join(f"{e['name']}({e['days_until']}日后)" for e in major_soon[:3])
+        triggers.append(f"📅 高风险分数 + 事件临近: {names} → 建议按上一档风险对待")
+
     return {
         "indicators": results,
         "total_score": total,
         "triggers": triggers,
-        "as_of": as_of_display
+        "as_of": as_of_display,
+        "smt": smt_info,
+        "prob": prob_info,
+        "events": upcoming_events
     }
 
 
@@ -561,6 +718,7 @@ def load_all_data(fred_api_key: str, period: str = "max") -> dict:
         "vix": fetch_yf("^VIX", period),
         "vix9d": fetch_yf("^VIX9D", period),  # 2011年才有
         "skew": fetch_yf("^SKEW", period),
+        "jpy": fetch_yf("JPY=X", period),  # USDJPY, carry unwind 警报用
     }
     
     # 如果 SPY 主数据也失败了, 用 spx 兜底
@@ -795,10 +953,67 @@ def main():
         else:
             st.success("✅ 无 Override 触发")
 
+        # SMT 背离 (NQ vs ES, 仅展示不计分)
+        st.markdown("### 🔀 SMT 背离 (NQ/ES)")
+        smt = result.get("smt")
+        if smt:
+            if smt["score"] > 0:
+                st.warning(f"{smt['detail']}")
+            else:
+                st.info(smt["detail"])
+            st.caption("日线SMT仅供参考, 回测显示无日线预测力, 不计入总分")
+
+    st.divider()
+
+    # ============== 回撤概率面板 (基于历史回测) ==============
+    prob = result.get("prob")
+    if prob:
+        st.subheader("📉 历史回撤概率 (当前分数段, 2010-2026回测)")
+        pcol1, pcol2 = st.columns(2)
+        with pcol1:
+            d10 = prob.get("d10")
+            if d10:
+                st.markdown(f"""
+                **未来 10 个交易日** (样本 n={d10['n']})
+                - 回撤 > 3% 概率: **{d10['p3']}%**
+                - 回撤 > 5% 概率: **{d10['p5']}%**
+                - 中位最大回撤: **{d10['med_dd']}%**
+                """)
+        with pcol2:
+            d20 = prob.get("d20")
+            if d20:
+                st.markdown(f"""
+                **未来 20 个交易日** (样本 n={d20['n']})
+                - 回撤 > 3% 概率: **{d20['p3']}%** | > 5%: **{d20['p5']}%** | > 10%: **{d20['p10']}%**
+                - 中位最大回撤: **{d20['med_dd']}%**
+                - 平均 20 日回报: **{d20['mean_ret']:+}%**
+                """)
+        st.caption("⚠️ 经验分布仅供参考, 不构成预测. 注意: 极低分(0-25)区间回撤概率同样高(崩盘延续期), 绿灯≠安全, 需结合分数变化方向判断.")
+
+    # ============== 事件风险窗口 ==============
+    events = result.get("events") or []
+    st.subheader("🗓️ 事件风险窗口 (未来 14 日)")
+    if events:
+        ecols = st.columns(min(len(events), 4))
+        type_icons = {"policy": "🏛️", "macro": "📊", "opex": "📆", "liquidity": "💧", "other": "📌"}
+        for i, ev in enumerate(events[:8]):
+            with ecols[i % len(ecols)]:
+                icon = type_icons.get(ev["type"], "📌")
+                days = ev["days_until"]
+                urgency = "🔴" if days <= 2 else "🟠" if days <= 5 else "⚪"
+                st.markdown(
+                    f"{urgency} {icon} **{ev['name']}**  \n"
+                    f"{ev['date'].strftime('%m-%d %a')} ({days}日后)"
+                )
+        st.caption("事件不计入评分; 高分(≥55)+重大事件5日内会在 Override 区给出升档建议. "
+                   "日历覆盖2026年(FOMC/BoJ官网确认, CPI确认至8月); IPO等手动事件在 config.yaml 的 manual_events 维护.")
+    else:
+        st.info("未来 14 日无已登记的重大事件 (日历覆盖2026年; 历史回看模式下仅显示 OPEX)")
+
     st.divider()
 
     # ============== 中部:各指标详情 ==============
-    st.subheader("🔍 8 大指标详情")
+    st.subheader("🔍 9 大指标详情")
 
     indicators_per_row = 4
     keys = list(config["weights"].keys())
@@ -913,3 +1128,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
