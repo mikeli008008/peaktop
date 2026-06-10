@@ -30,9 +30,25 @@ warnings.filterwarnings("ignore")
 # ============================================================
 
 @st.cache_data
+@st.cache_data(ttl=300)  # 5分钟过期: config.yaml 更新后无需 Reboot 即可生效
 def load_config():
     with open("config.yaml", "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+# v5.1 必需的 config 段落 — 启动自检, 缺失时给出明确错误而非 KeyError
+REQUIRED_CONFIG_SECTIONS = [
+    "weights", "risk_levels", "overrides",
+    "cta_positioning", "overextension", "vix_skew", "gamma_env",
+    "ad_divergence", "concentration", "putcall_proxy",
+    "hy_spread", "fed_liquidity",
+    "prob_table_10d", "prob_table_20d", "events",
+]
+
+
+def validate_config(config: dict) -> list:
+    """返回缺失的段落列表; 空列表 = config 是完整的 v5.1 版本"""
+    return [k for k in REQUIRED_CONFIG_SECTIONS if k not in config]
 
 
 def get_fred_key() -> str:
@@ -748,17 +764,26 @@ def compute_historical_scores(_data: dict, _config: dict, days: int = 730) -> pd
     if spx.empty or len(spx) < days:
         return pd.DataFrame()
 
-    dates = spx.index[-days::5]
+    dates = list(spx.index[-days::5])
+    # 确保最新交易日始终包含 (修复: 周采样导致曲线滞后最多4个交易日)
+    if len(dates) == 0 or dates[-1] != spx.index[-1]:
+        dates.append(spx.index[-1])
+
+    ndx = _data.get("ndx", pd.DataFrame())
 
     records = []
     for date in dates:
         try:
             result = compute_all_scores(_data, _config, as_of=date)
-            records.append({
+            rec = {
                 "date": date,
                 "total_score": result["total_score"],
                 "spx_close": float(spx.loc[spx.index <= date, "Close"].iloc[-1])
-            })
+            }
+            if not ndx.empty:
+                nd = ndx.loc[ndx.index <= date, "Close"]
+                rec["ndx_close"] = float(nd.iloc[-1]) if len(nd) else None
+            records.append(rec)
         except Exception:
             continue
 
@@ -776,13 +801,34 @@ def main():
         layout="wide",
         initial_sidebar_state="expanded",
         menu_items={
-            "Get Help": "https://github.com/YOUR_USERNAME/peak-detector",
-            "Report a Bug": "https://github.com/YOUR_USERNAME/peak-detector/issues",
+            "Get Help": "https://github.com/mikeli008008/peaktop",
+            "Report a Bug": "https://github.com/mikeli008008/peaktop/issues",
             "About": "Peak Detector - 美股顶部风险预警系统. 仅供研究和教育用途."
         }
     )
 
-    config = load_config()
+    try:
+        config = load_config()
+    except yaml.YAMLError as e:
+        st.error(
+            f"❌ **config.yaml 文件损坏 (YAML 语法错误)**\n\n"
+            f"最常见原因: 编辑时旧内容没删干净, 新旧混在一起。\n\n"
+            f"修复: 不要手动粘贴 — 用 GitHub 的 **Add file → Upload files** 上传完整的 config.yaml 文件整体覆盖。\n\n"
+            f"错误详情 (含行号):\n```\n{e}\n```"
+        )
+        st.stop()
+
+    # config 版本自检: 缺段落时给出明确指引
+    missing = validate_config(config)
+    if missing:
+        st.error(
+            f"❌ **config.yaml 版本不匹配** — 缺少以下段落: `{'`, `'.join(missing)}`\n\n"
+            f"GitHub 上的 config.yaml 不是最新的 v5.1 版本。修复方法:\n"
+            f"1. 在 GitHub 打开 config.yaml → 编辑 → 全选删除 → 粘贴完整的 v5.1 config → Commit\n"
+            f"2. 提交后在 Raw 视图确认能搜到 `overextension`、`prob_table_20d`、`events` 三个关键词\n"
+            f"3. 等待自动重新部署 (本检查每5分钟刷新, 无需 Reboot)"
+        )
+        st.stop()
 
     # 标题
     st.title("📊 Peak Detector")
@@ -866,10 +912,10 @@ def main():
         - 8 个指标覆盖 5 大维度
         - 总分 ≥ 65 进入风险窗口
         - 总分变化速度比绝对值更重要
-        - 详见 [methodology.md](https://github.com/YOUR_USERNAME/peak-detector/blob/main/methodology.md)
+        - 详见 [methodology.md](https://github.com/mikeli008008/peaktop/blob/main/methodology.md)
         """)
         st.divider()
-        st.caption("🌟 喜欢的话给个 [GitHub Star](https://github.com/YOUR_USERNAME/peak-detector)")
+        st.caption("🌟 喜欢的话给个 [GitHub Star](https://github.com/mikeli008008/peaktop)")
 
     # 计算评分
     result = compute_all_scores(data, config, as_of=as_of_date)
@@ -909,43 +955,78 @@ def main():
             st.text(f"{ind['name']:25s} | 分数 {ind['score']}/10 | {ind['detail']}")
 
     # ============== 顶部:总分大显示 ==============
-    col1, col2, col3 = st.columns([2, 1, 1])
+    date_str = result["as_of"].strftime("%Y-%m-%d")
+    st.markdown(f"#### 评分日期: {date_str}")
+
+    col1, col2, col3 = st.columns([1.1, 1.3, 1.0], gap="medium")
 
     with col1:
-        date_str = result["as_of"].strftime("%Y-%m-%d")
-        st.markdown(f"### 评分日期: {date_str}")
-
         st.markdown(
             f"""
-            <div style='text-align:center; padding: 20px;
+            <div style='text-align:center; padding: 24px 20px;
                         background: linear-gradient(135deg, {risk_level["color"]}22, {risk_level["color"]}44);
                         border-radius: 12px; border-left: 6px solid {risk_level["color"]};'>
-                <div style='font-size: 18px; color: #888;'>当前风险评分</div>
-                <div style='font-size: 72px; font-weight: bold; color: {risk_level["color"]};'>
+                <div style='font-size: 15px; color: #888;'>当前风险评分</div>
+                <div style='font-size: 64px; font-weight: bold; line-height: 1.1; color: {risk_level["color"]};'>
                     {total:.1f}
                 </div>
-                <div style='font-size: 24px; margin-top: 8px;'>{risk_level["level"]}</div>
-                <div style='font-size: 16px; color: #aaa; margin-top: 8px;'>{risk_level["advice"]}</div>
+                <div style='font-size: 22px; margin-top: 6px;'>{risk_level["level"]}</div>
+                <div style='font-size: 14px; color: #aaa; margin-top: 6px;'>{risk_level["advice"]}</div>
             </div>
             """,
             unsafe_allow_html=True
         )
 
-    with col2:
-        st.markdown("### 📍 各维度贡献")
-        weights = config["weights"]
-        for key in weights:
-            ind = result["indicators"][key]
-            contribution = ind["score"] * weights[key] * 10
+        # SMT 状态作为紧凑徽章放在分数卡下方
+        smt = result.get("smt")
+        if smt:
+            smt_bg = "#7c2d1222" if smt["score"] > 0 else "#1a1a1a"
+            smt_border = "#f97316" if smt["score"] > 0 else "#333"
             st.markdown(
-                f"**{ind['name']}**: "
-                f"<span style='color:{risk_level['color']}'>{ind['score']}/10</span> "
-                f"(贡献 {contribution:.1f})",
+                f"""
+                <div style='margin-top: 10px; padding: 10px 14px; border-radius: 8px;
+                            border: 1px solid {smt_border}; background: {smt_bg};
+                            font-size: 13px;'>
+                    🔀 <b>SMT (NQ/ES 日线)</b>: {smt['detail']}
+                    <span style='color:#666;'>· 仅展示不计分</span>
+                </div>
+                """,
                 unsafe_allow_html=True
             )
 
+    with col2:
+        st.markdown("##### 📍 各维度贡献 (合计 = 总分)")
+        weights = config["weights"]
+        contrib = []
+        for key in weights:
+            ind = result["indicators"][key]
+            contrib.append((ind["name"], ind["score"] * weights[key] * 10, ind["score"]))
+        contrib.sort(key=lambda x: x[1])
+
+        bar_colors = ["#22c55e" if s <= 3 else "#eab308" if s <= 6 else "#ef4444"
+                      for _, _, s in contrib]
+        fig_c = go.Figure(go.Bar(
+            x=[c for _, c, _ in contrib],
+            y=[n for n, _, _ in contrib],
+            orientation="h",
+            marker=dict(color=bar_colors),
+            text=[f"{c:.1f} ({s}/10)" for _, c, s in contrib],
+            textposition="outside",
+            textfont=dict(size=11),
+            hovertemplate="%{y}: 贡献 %{x:.1f}<extra></extra>"
+        ))
+        fig_c.update_layout(
+            height=340,
+            margin=dict(l=0, r=55, t=5, b=5),
+            template="plotly_dark",
+            xaxis=dict(title=None, range=[0, max(c for _, c, _ in contrib) * 1.35]),
+            yaxis=dict(tickfont=dict(size=11)),
+            showlegend=False,
+        )
+        st.plotly_chart(fig_c, use_container_width=True)
+
     with col3:
-        st.markdown("### 🚨 Override 触发")
+        st.markdown("##### 🚨 Override 触发")
         if result["triggers"]:
             for t in result["triggers"]:
                 st.error(t)
@@ -953,57 +1034,52 @@ def main():
         else:
             st.success("✅ 无 Override 触发")
 
-        # SMT 背离 (NQ vs ES, 仅展示不计分)
-        st.markdown("### 🔀 SMT 背离 (NQ/ES)")
-        smt = result.get("smt")
-        if smt:
-            if smt["score"] > 0:
-                st.warning(f"{smt['detail']}")
-            else:
-                st.info(smt["detail"])
-            st.caption("日线SMT仅供参考, 回测显示无日线预测力, 不计入总分")
-
     st.divider()
 
     # ============== 回撤概率面板 (基于历史回测) ==============
     prob = result.get("prob")
     if prob:
-        st.subheader("📉 历史回撤概率 (当前分数段, 2010-2026回测)")
-        pcol1, pcol2 = st.columns(2)
-        with pcol1:
-            d10 = prob.get("d10")
-            if d10:
-                st.markdown(f"""
-                **未来 10 个交易日** (样本 n={d10['n']})
-                - 回撤 > 3% 概率: **{d10['p3']}%**
-                - 回撤 > 5% 概率: **{d10['p5']}%**
-                - 中位最大回撤: **{d10['med_dd']}%**
-                """)
-        with pcol2:
-            d20 = prob.get("d20")
-            if d20:
-                st.markdown(f"""
-                **未来 20 个交易日** (样本 n={d20['n']})
-                - 回撤 > 3% 概率: **{d20['p3']}%** | > 5%: **{d20['p5']}%** | > 10%: **{d20['p10']}%**
-                - 中位最大回撤: **{d20['med_dd']}%**
-                - 平均 20 日回报: **{d20['mean_ret']:+}%**
-                """)
-        st.caption("⚠️ 经验分布仅供参考, 不构成预测. 注意: 极低分(0-25)区间回撤概率同样高(崩盘延续期), 绿灯≠安全, 需结合分数变化方向判断.")
+        st.markdown("##### 📉 历史回撤概率 — 当前分数段 (2010-2026 回测)")
+        d10 = prob.get("d10")
+        d20 = prob.get("d20")
+        mcols = st.columns(6)
+        if d10:
+            mcols[0].metric("10日 回撤>3%", f"{d10['p3']}%")
+            mcols[1].metric("10日 回撤>5%", f"{d10['p5']}%")
+            mcols[2].metric("10日 中位回撤", f"{d10['med_dd']}%")
+        if d20:
+            mcols[3].metric("20日 回撤>5%", f"{d20['p5']}%")
+            mcols[4].metric("20日 回撤>10%", f"{d20['p10']}%")
+            mcols[5].metric("20日 平均回报", f"{d20['mean_ret']:+}%",
+                            delta=f"样本 n={d20['n']}", delta_color="off")
+        st.caption("⚠️ 经验分布仅供参考, 不构成预测. 极低分(0-25)区间回撤概率同样高(崩盘延续期), 绿灯≠安全, 需结合分数变化方向判断.")
+
+    st.divider()
 
     # ============== 事件风险窗口 ==============
     events = result.get("events") or []
-    st.subheader("🗓️ 事件风险窗口 (未来 14 日)")
+    st.markdown("##### 🗓️ 事件风险窗口 (未来 14 日)")
     if events:
-        ecols = st.columns(min(len(events), 4))
         type_icons = {"policy": "🏛️", "macro": "📊", "opex": "📆", "liquidity": "💧", "other": "📌"}
+        ecols = st.columns(4)
         for i, ev in enumerate(events[:8]):
-            with ecols[i % len(ecols)]:
+            with ecols[i % 4]:
                 icon = type_icons.get(ev["type"], "📌")
                 days = ev["days_until"]
-                urgency = "🔴" if days <= 2 else "🟠" if days <= 5 else "⚪"
+                border = "#ef4444" if days <= 2 else "#f97316" if days <= 5 else "#555"
+                day_label = "今天" if days == 0 else f"{days}日后"
                 st.markdown(
-                    f"{urgency} {icon} **{ev['name']}**  \n"
-                    f"{ev['date'].strftime('%m-%d %a')} ({days}日后)"
+                    f"""
+                    <div style='padding: 10px 12px; border-radius: 8px; margin-bottom: 8px;
+                                border: 1px solid #333; border-left: 4px solid {border};
+                                background: #1a1a1a; min-height: 62px;'>
+                        <div style='font-size: 13px; font-weight: 600;'>{icon} {ev['name']}</div>
+                        <div style='font-size: 12px; color: #888; margin-top: 3px;'>
+                            {ev['date'].strftime('%m-%d %a')} · <b style='color:{border};'>{day_label}</b>
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
                 )
         st.caption("事件不计入评分; 高分(≥55)+重大事件5日内会在 Override 区给出升档建议. "
                    "日历覆盖2026年(FOMC/BoJ官网确认, CPI确认至8月); IPO等手动事件在 config.yaml 的 manual_events 维护.")
@@ -1045,18 +1121,21 @@ def main():
     st.divider()
 
     # ============== 下部:历史曲线 ==============
-    st.subheader("📈 历史风险评分曲线 (过去 ~2 年, 每周采样)")
+    st.subheader("📈 历史风险评分曲线 (过去 ~2 年, 每周采样 + 最新交易日)")
 
     with st.spinner("计算历史评分..."):
         hist = compute_historical_scores(data, config, days=500)
 
     if not hist.empty:
+        has_ndx = "ndx_close" in hist.columns and hist["ndx_close"].notna().any()
+        n_rows = 3 if has_ndx else 2
         fig = make_subplots(
-            rows=2, cols=1,
+            rows=n_rows, cols=1,
             shared_xaxes=True,
-            vertical_spacing=0.08,
-            row_heights=[0.6, 0.4],
-            subplot_titles=("风险评分", "标普 500")
+            vertical_spacing=0.06,
+            row_heights=[0.5, 0.25, 0.25] if has_ndx else [0.6, 0.4],
+            subplot_titles=("风险评分", "纳指 NDX (NQ 现货)", "标普 500") if has_ndx
+                            else ("风险评分", "标普 500")
         )
 
         fig.add_trace(
@@ -1064,6 +1143,7 @@ def main():
                 x=hist.index, y=hist["total_score"],
                 mode="lines+markers",
                 line=dict(color="#f97316", width=2),
+                marker=dict(size=4),
                 name="Total Score",
                 hovertemplate="%{x|%Y-%m-%d}<br>评分: %{y:.1f}<extra></extra>"
             ),
@@ -1076,6 +1156,18 @@ def main():
                 opacity=0.4, row=1, col=1
             )
 
+        if has_ndx:
+            fig.add_trace(
+                go.Scatter(
+                    x=hist.index, y=hist["ndx_close"],
+                    mode="lines",
+                    line=dict(color="#a78bfa", width=2),
+                    name="NDX",
+                    hovertemplate="%{x|%Y-%m-%d}<br>NDX: %{y:.0f}<extra></extra>"
+                ),
+                row=2, col=1
+            )
+
         fig.add_trace(
             go.Scatter(
                 x=hist.index, y=hist["spx_close"],
@@ -1084,17 +1176,19 @@ def main():
                 name="S&P 500",
                 hovertemplate="%{x|%Y-%m-%d}<br>SPX: %{y:.0f}<extra></extra>"
             ),
-            row=2, col=1
+            row=n_rows, col=1
         )
 
         fig.update_layout(
-            height=600,
+            height=750 if has_ndx else 600,
             showlegend=False,
             hovermode="x unified",
             template="plotly_dark"
         )
         fig.update_yaxes(title_text="评分", range=[0, 100], row=1, col=1)
-        fig.update_yaxes(title_text="SPX", row=2, col=1)
+        if has_ndx:
+            fig.update_yaxes(title_text="NDX", row=2, col=1)
+        fig.update_yaxes(title_text="SPX", row=n_rows, col=1)
 
         st.plotly_chart(fig, use_container_width=True)
 
@@ -1123,9 +1217,8 @@ def main():
             "数据来源: FRED, Yahoo Finance."
         )
     with col_b:
-        st.caption("📦 [GitHub](https://github.com/YOUR_USERNAME/peak-detector) | MIT License")
+        st.caption("📦 [GitHub](https://github.com/mikeli008008/peaktop) | MIT License")
 
 
 if __name__ == "__main__":
     main()
-
