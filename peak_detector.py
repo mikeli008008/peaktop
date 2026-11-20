@@ -794,6 +794,65 @@ def compute_historical_scores(_data: dict, _config: dict, days: int = 730) -> pd
 # Streamlit UI
 # ============================================================
 
+# ============================================================
+# 宏观背景 (仅供参考, 不计入评分) — 2026-11-20 新增
+# 利率周期、政策/地缘不确定性、美国中期选举周期。
+# nq-replay 实验室回测 (research/peaktop/v12.py, 2012-2026): 利率上行对后续 NQ 略偏负 (IC -0.13);
+# 政策/地缘不确定性方向相反: 高不确定性之后 NQ 反而略好 (IC +0.09)。中期选举只有 4 个样本, 无法检验。
+# ============================================================
+
+def midterm_date(year: int) -> pd.Timestamp:
+    """美国大选日: 11 月第一个周一之后的周二"""
+    d = pd.Timestamp(year, 11, 1)
+    first_mon = d + pd.Timedelta(days=(0 - d.dayofweek) % 7)
+    return first_mon + pd.Timedelta(days=1)
+
+
+def election_cycle_phase(ref: pd.Timestamp) -> Tuple[str, str]:
+    """返回 (阶段, 说明)。中期选举年 = 年份除以 4 余 2 (2022, 2026, 2030)"""
+    y = ref.year
+    if y % 4 == 2:
+        e = midterm_date(y)
+        if ref < e:
+            return "中期选举年 (选前)", f"距中期选举 {(e - ref).days} 天 ({e.date()})。历史上选前数月波动偏大、回报偏弱。"
+        return "中期选举后", f"{e.date()} 中期选举后。历史上选后 12 个月美股偏强 (样本少, 仅作参考)。"
+    if y % 4 == 3:
+        e = midterm_date(y - 1)
+        if ref < e + pd.Timedelta(days=365):
+            return "中期选举后 12 个月内", f"{e.date()} 中期选举后第 {(ref - e).days} 天。历史上这一段偏强 (样本少, 仅作参考)。"
+        return "大选前一年", "历史上大选前一年整体偏强。"
+    if y % 4 == 0:
+        return "总统大选年", f"大选日 {midterm_date(y).date()}。政策不确定性通常在选前升高。"
+    return "新总统第一年", "新政府政策落地期, 历史上回报分化较大。"
+
+
+def macro_context(fred_key: str, ref: pd.Timestamp) -> dict:
+    """利率与政策不确定性读数 (截至 ref)。缺数据时对应项为 None, 不会显示为 0。"""
+    out = {}
+    def last_change(sid, n_obs):
+        s = fetch_fred(sid, fred_key, "2018-01-01")
+        if s.empty:
+            return None, None
+        s = s[s.index <= ref]
+        if len(s) <= n_obs:
+            return None, None
+        return float(s.iloc[-1]), float(s.iloc[-1] - s.iloc[-1 - n_obs])
+    out["dgs2"] = last_change("DGS2", 126)          # 约 6 个月
+    out["dfii10"] = last_change("DFII10", 126)
+    out["curve"] = last_change("T10Y2Y", 126)
+    epu = fetch_fred("USEPUINDXD", fred_key, "2018-01-01")
+    if not epu.empty:
+        epu = epu[epu.index <= ref]
+    if len(epu) > 800:
+        m30 = epu.rolling(30, min_periods=20).mean()
+        hist = m30.iloc[-756:].dropna()
+        out["epu"] = (float(m30.iloc[-1]), float((hist < m30.iloc[-1]).mean()))
+    else:
+        out["epu"] = None
+    out["cycle"] = election_cycle_phase(ref)
+    return out
+
+
 def main():
     st.set_page_config(
         page_title="Peak Detector | 美股顶部风险预警",
@@ -1117,6 +1176,29 @@ def main():
                     """,
                     unsafe_allow_html=True
                 )
+
+    # ============== 宏观背景 (不计入评分) ==============
+    st.subheader("🏛️ 宏观背景 (仅供参考, 不计入评分)")
+    ref_date = pd.Timestamp(as_of_date) if as_of_date else pd.Timestamp(datetime.now().date())
+    mc = macro_context(fred_key, ref_date)
+    mcols = st.columns(5)
+    def show(col, label, val, help_txt):
+        with col:
+            st.metric(label, val, help=help_txt)
+    d = mc["dgs2"]; show(mcols[0], "2年期美债收益率 (6个月变化)",
+                         f"{d[0]:.2f}% ({d[1]:+.2f})" if d[0] is not None else "数据缺失",
+                         "利率上行 = 企业借贷成本上升。回测中略偏负 (IC -0.13), 2022 年后更明显。")
+    d = mc["dfii10"]; show(mcols[1], "10年期实际利率 (6个月变化)",
+                          f"{d[0]:.2f}% ({d[1]:+.2f})" if d[0] is not None else "数据缺失",
+                          "扣除通胀后的借贷成本 (TIPS)。")
+    d = mc["curve"]; show(mcols[2], "10年-2年利差",
+                         f"{d[0]:+.2f}%" if d[0] is not None else "数据缺失",
+                         "负值 = 收益率曲线倒挂。")
+    e = mc["epu"]; show(mcols[3], "政策不确定性 (EPU, 30日均值)",
+                       f"{e[0]:.0f} (近3年 P{e[1]*100:.0f})" if e else "数据缺失",
+                       "Baker-Bloom-Davis 每日指数。注意: 回测中高不确定性之后 NQ 反而略好, 方向与直觉相反。")
+    ph, note = mc["cycle"]; show(mcols[4], "美国选举周期", ph, note)
+    st.caption(f"选举周期: {note} 2010-2026 只有 4 次中期选举, 无法做统计检验, 因此不计入总分。")
 
     st.divider()
 
