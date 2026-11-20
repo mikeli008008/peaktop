@@ -180,3 +180,17 @@ losses arising from the use of this software.**
 ---
 
 **如果这个项目对你有用,请给个 ⭐ Star! / If this project helps you, please give a ⭐ Star!**
+
+## Peak Detector v1.2 (seven families) — `pages/1_Peak_Detector_v1_2.py`
+
+A second page in the app (sidebar). Seven independent risk families — trend, breadth, volatility, credit, Fed
+liquidity, rates (borrowing costs) and policy/geopolitical uncertainty — each ranked against its own last three years
+and averaged into a 0-100 score. Calculation: `peak_v12.py` (no Streamlit; tests: `python test_v12.py`).
+
+- Data: Yahoo Finance (ES=F, NQ=F, VIX, VIX9D, SKEW, SPY, RSP, HYG, IEF, S&P 500 members for breadth), FRED
+  (WALCL, WTREGEN, RRPONTSYD, DGS2, DFII10, T10Y2Y, USEPUINDXD), daily Geopolitical Risk index. Needs FRED_API_KEY.
+- Refreshes every 4 hours (cache), so it is current after each close.
+- Lab backtest (nq-replay, 2012 to 2026-02-20): adding 0.25x NQ when the score is in its own bottom 20% beat
+  buy-and-hold in all three eras; edge t +2.89 (below the lab's money bar of 3). Forward paper from 2026-11-23.
+- On the lab's own data this module matches the lab build day for day (score within 0.02, same exposure on all
+  3,442 days).
